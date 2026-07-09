@@ -68,15 +68,11 @@ public final class CoreExampleMain {
             server.getRoomOperations(room)
                     .sendEvent("pong", "pong: " + data);
         });
-        server.addEventListener("hi", String.class, (client, data, ack) -> {
-            String room = client.getSessionId().toString();
-            server.getRoomOperations(room)
-                    .sendEvent("pong", "pong: " + data);
+        server.addEventListener("hi", byte[].class, (client, data, ack) -> {
+            client.sendEvent("hello", "pong: " + data);
         });
-        server.getNamespace("/example").addEventListener("hi", String.class, (client, data, ack) -> {
-            String room = client.getSessionId().toString();
-            server.getRoomOperations(room)
-                    .sendEvent("pong", "pong: " + data);
+        server.getNamespace("/example").addEventListener("hi", byte[].class, (client, data, ack) -> {
+            client.sendEvent("hello", "pong: " + data);
         });
 
         server.start();
