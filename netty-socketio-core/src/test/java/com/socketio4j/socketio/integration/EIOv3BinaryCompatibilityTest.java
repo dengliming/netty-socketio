@@ -21,10 +21,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import com.socketio4j.socketio.SocketIOClient;
-
+import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
+import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
@@ -95,5 +95,125 @@ public class EIOv3BinaryCompatibilityTest extends AbstractSocketIOIntegrationTes
         assertArrayEquals(expectedData, receivedData.get(), "The EIOv3 prefix byte 4 should be stripped, yielding [10, 20, 30]");
 
         webSocket.close(1000, "Done");
+    }
+
+    @Test
+    @DisplayName("Should successfully decode binary event attachment from EIOv3 Polling client using Base64")
+    public void testEIOv3BinaryPollingBase64() throws Exception {
+        final AtomicReference<byte[]> receivedData = new AtomicReference<byte[]>();
+
+        // 1. Add event listener
+        getServer().addEventListener(
+                "testBinary", byte[].class,
+                (client, data, ackRequest) -> {
+                    receivedData.set(data);
+                }
+        );
+
+        OkHttpClient client = new OkHttpClient();
+
+        // 2. Perform handshake
+        String sid = performHandshake(client);
+
+        // 3. Namespace connect packet: "40" -> payload: "2:40"
+        sendPollingPost(client, sid, "2:40");
+
+        // 4. Send event metadata packet: "451-[\"testBinary\",{\"_placeholder\":true,\"num\":0}]" -> length 48
+        sendPollingPost(client, sid, "48:451-[\"testBinary\",{\"_placeholder\":true,\"num\":0}]");
+
+        // 5. Send base64-encoded attachment packet: "b4AQID" (base64 of [1, 2, 3]) -> length 6
+        sendPollingPost(client, sid, "6:b4AQID");
+
+        // 6. Verify server received payload
+        await().atMost(5, SECONDS)
+                .until(() -> receivedData.get() != null);
+
+        byte[] expectedData = {1, 2, 3};
+        assertNotNull(receivedData.get());
+        assertArrayEquals(expectedData, receivedData.get());
+    }
+
+    @Test
+    @DisplayName("Should successfully decode binary event attachment from EIOv3 Polling client using raw binary wrapper")
+    public void testEIOv3BinaryPollingWrapper() throws Exception {
+        final AtomicReference<byte[]> receivedData = new AtomicReference<byte[]>();
+
+        // 1. Add event listener
+        getServer().addEventListener(
+                "testBinary", byte[].class,
+                (client, data, ackRequest) -> {
+                    receivedData.set(data);
+                }
+        );
+
+        OkHttpClient client = new OkHttpClient();
+
+        // 2. Perform handshake
+        String sid = performHandshake(client);
+
+        // 3. Namespace connect packet: "40" -> payload: "2:40"
+        sendPollingPost(client, sid, "2:40");
+
+        // 4. Send event metadata packet: "451-[\"testBinary\",{\"_placeholder\":true,\"num\":0}]" -> length 48
+        sendPollingPost(client, sid, "48:451-[\"testBinary\",{\"_placeholder\":true,\"num\":0}]");
+
+        // 5. Send raw binary wrapped payload: indicator 1, length 4 (since payload [4, 10, 20, 30] has length 4), separator 255
+        // bytes: [1, 52, -1, 4, 10, 20, 30] (where 52 is ASCII '4', -1 is delimiter 255, 4 is EIOv3 MESSAGE prefix)
+        byte[] binaryBody = {1, 52, -1, 4, 10, 20, 30};
+        sendPollingPostBinary(client, sid, binaryBody);
+
+        // 6. Verify server received payload
+        await().atMost(5, SECONDS)
+                .until(() -> receivedData.get() != null);
+
+        byte[] expectedData = {10, 20, 30};
+        assertNotNull(receivedData.get());
+        assertArrayEquals(expectedData, receivedData.get());
+    }
+
+    private String performHandshake(OkHttpClient client) throws Exception {
+        Request request = new Request.Builder()
+                .url("http://" + getServerHost() + ":" + getServerPort() + "/socket.io/?EIO=3&transport=polling")
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            String body = response.body().string();
+            int jsonStartIndex = body.indexOf('{');
+            if (jsonStartIndex == -1) {
+                throw new IllegalStateException("Invalid handshake response format: " + body);
+            }
+            String json = body.substring(jsonStartIndex);
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"sid\":\"([^\"]+)\"");
+            java.util.regex.Matcher matcher = pattern.matcher(json);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+            throw new IllegalStateException("sid not found in handshake response: " + body);
+        }
+    }
+
+    private void sendPollingPost(OkHttpClient client, String sid, String textBody) throws Exception {
+        RequestBody requestBody = RequestBody.create(MediaType.parse("text/plain; charset=utf-8"), textBody);
+        Request request = new Request.Builder()
+                .url("http://" + getServerHost() + ":" + getServerPort() + "/socket.io/?EIO=3&transport=polling&sid=" + sid)
+                .post(requestBody)
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IllegalStateException("POST failed: " + response.code() + " " + response.body().string());
+            }
+        }
+    }
+
+    private void sendPollingPostBinary(OkHttpClient client, String sid, byte[] binaryBody) throws Exception {
+        RequestBody requestBody = RequestBody.create(MediaType.parse("application/octet-stream"), binaryBody);
+        Request request = new Request.Builder()
+                .url("http://" + getServerHost() + ":" + getServerPort() + "/socket.io/?EIO=3&transport=polling&sid=" + sid)
+                .post(requestBody)
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IllegalStateException("POST failed: " + response.code() + " " + response.body().string());
+            }
+        }
     }
 }
