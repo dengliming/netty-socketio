@@ -68,7 +68,7 @@
         <dependency>
             <groupId>com.socketio4j</groupId>
             <artifactId>netty-socketio-core</artifactId>
-            <version>4.0.1</version>
+            <version>4.0.2-SNAPSHOT</version>
         </dependency>
 
         <!-- Netty -->
@@ -121,6 +121,18 @@
             <groupId>at.yawk.lz4</groupId>
             <artifactId>lz4-java</artifactId>
             <version>1.10.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.jspecify</groupId>
+            <artifactId>jspecify</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.hazelcast</groupId>
+            <artifactId>hazelcast</artifactId>
+            <version>5.2.5</version>
         </dependency>
 
     </dependencies>

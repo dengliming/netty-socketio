@@ -36,11 +36,19 @@ public final class EventMessageSerializer
         implements Serializer<EventMessage> {
     private static final Logger log = LoggerFactory.getLogger(EventMessageSerializer.class);
 
-    private static final ObjectMapper MAPPER =
-            JsonMapper.builder()
-                    .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
-                    .disable(MapperFeature.DEFAULT_VIEW_INCLUSION)
-                    .build();
+    private static final ObjectMapper MAPPER;
+
+    static {
+        MAPPER = JsonMapper.builder()
+                .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
+                .disable(MapperFeature.DEFAULT_VIEW_INCLUSION)
+                .build();
+        MAPPER.activateDefaultTyping(
+                MAPPER.getPolymorphicTypeValidator(),
+                ObjectMapper.DefaultTyping.NON_FINAL,
+                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY
+        );
+    }
 
     @Override
     public byte[] serialize(String topic, EventMessage data) {

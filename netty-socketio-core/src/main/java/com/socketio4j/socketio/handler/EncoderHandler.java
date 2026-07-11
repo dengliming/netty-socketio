@@ -36,6 +36,7 @@ import com.socketio4j.socketio.messages.HttpMessage;
 import com.socketio4j.socketio.messages.OutPacketMessage;
 import com.socketio4j.socketio.messages.XHROptionsMessage;
 import com.socketio4j.socketio.messages.XHRPostMessage;
+import com.socketio4j.socketio.protocol.EngineIOVersion;
 import com.socketio4j.socketio.protocol.Packet;
 import com.socketio4j.socketio.protocol.PacketEncoder;
 
@@ -337,7 +338,10 @@ public class EncoderHandler extends ChannelOutboundHandlerAdapter {
 
             for (ByteBuf buf : packet.getAttachments()) {
                 ByteBuf outBuf = encoder.allocateBuffer(ctx.alloc());
-                outBuf.writeByte(4);
+                if (EngineIOVersion.V3.equals(packet.getEngineIOVersion())
+                        || EngineIOVersion.V2.equals(packet.getEngineIOVersion())) {
+                    outBuf.writeByte(4);
+                }
                 outBuf.writeBytes(buf);
                 if (log.isTraceEnabled()) {
                     log.trace("Out attachment: {} sessionId: {}", ByteBufUtil.hexDump(outBuf), msg.getSessionId());

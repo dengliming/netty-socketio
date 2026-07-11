@@ -35,6 +35,11 @@ public final class EventMessageCodec {
                         .FAIL_ON_UNKNOWN_PROPERTIES,
                 false
         );
+        MAPPER.activateDefaultTyping(
+                MAPPER.getPolymorphicTypeValidator(),
+                ObjectMapper.DefaultTyping.NON_FINAL,
+                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY
+        );
     }
 
     private EventMessageCodec() {

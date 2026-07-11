@@ -34,11 +34,19 @@ public final class EventMessageDeserializer
         implements Deserializer<EventMessage> {
     private static final Logger log = LoggerFactory.getLogger(EventMessageDeserializer.class);
 
-    private static final ObjectMapper MAPPER =
-            JsonMapper.builder()
-                    .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-                    .enable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE)
-                    .build();
+    private static final ObjectMapper MAPPER;
+
+    static {
+        MAPPER = JsonMapper.builder()
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                .enable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE)
+                .build();
+        MAPPER.activateDefaultTyping(
+                MAPPER.getPolymorphicTypeValidator(),
+                ObjectMapper.DefaultTyping.NON_FINAL,
+                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY
+        );
+    }
 
     @Override
     public EventMessage deserialize(String topic, byte[] data) {
