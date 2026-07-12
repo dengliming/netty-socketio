@@ -466,8 +466,15 @@ public class PacketDecoder {
                 int headEndIndex = frame.bytesBefore((byte) -1);
                 if (headEndIndex != -1) {
                     int len = (int) readLong(frame, headEndIndex);
-                    payload = frame.slice(frame.readerIndex() + 1, len);
-                    frame.readerIndex(frame.readerIndex() + 1 + len);
+                    int payloadStart = frame.readerIndex() + 1; // skip 0xFF separator
+                    if (payloadStart + len > frame.writerIndex()) {
+                        throw new IOException("Malformed polling wrapper: length " + len
+                                + " exceeds remaining frame bytes " + (frame.writerIndex() - payloadStart));
+                    }
+                    payload = frame.slice(payloadStart, len);
+                    frame.readerIndex(payloadStart + len);
+                } else {
+                    throw new IOException("Malformed polling wrapper: missing 0xFF separator");
                 }
             }
 
