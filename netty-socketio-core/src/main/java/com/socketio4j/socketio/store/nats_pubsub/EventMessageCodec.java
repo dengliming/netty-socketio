@@ -21,7 +21,12 @@ package com.socketio4j.socketio.store.nats_pubsub;
  * @date 22/12/25 4:04 pm
  */
 
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
 import com.socketio4j.socketio.store.event.EventMessage;
 
 public final class EventMessageCodec {
@@ -29,17 +34,21 @@ public final class EventMessageCodec {
     private static final ObjectMapper MAPPER;
 
     static {
-        MAPPER = new ObjectMapper();
-        MAPPER.configure(
-                com.fasterxml.jackson.databind.DeserializationFeature
-                        .FAIL_ON_UNKNOWN_PROPERTIES,
-                false
-        );
-        MAPPER.activateDefaultTyping(
-                MAPPER.getPolymorphicTypeValidator(),
-                ObjectMapper.DefaultTyping.NON_FINAL,
-                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY
-        );
+        PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
+                .allowIfSubType("com.socketio4j.socketio")
+                .allowIfBaseType("java.util")
+                .allowIfSubType("java.util.Arrays$")
+                .allowIfSubTypeIsArray()
+                .allowIfSubType("java.time")
+                .allowIfSubType("java.math")
+                .build();
+
+        MAPPER = JsonMapper.builder()
+                .polymorphicTypeValidator(ptv)
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                .enable(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE)
+                .build();
+        MAPPER.activateDefaultTyping(ptv, ObjectMapper.DefaultTyping.NON_FINAL, JsonTypeInfo.As.PROPERTY);
     }
 
     private EventMessageCodec() {
