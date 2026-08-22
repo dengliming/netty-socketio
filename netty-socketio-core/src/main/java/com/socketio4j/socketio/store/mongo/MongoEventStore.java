@@ -16,7 +16,9 @@
  */
 package com.socketio4j.socketio.store.mongo;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,12 +37,14 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.mongodb.client.ChangeStreamIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
-import com.mongodb.client.model.changestream.FullDocument;
+import com.mongodb.client.model.changestream.OperationType;
 
 import com.socketio4j.socketio.store.event.EventListener;
 import com.socketio4j.socketio.store.event.EventMessage;
@@ -57,6 +61,10 @@ import com.socketio4j.socketio.store.event.PublishMode;
  * events to subscribers. Each event type maps to its own collection (MULTI_CHANNEL)
  * or all events go into one collection (SINGLE_CHANNEL).
  * <p>
+ * A TTL index is created on each collection to automatically expire documents
+ * after a configurable retention period (default 60 seconds), preventing
+ * unbounded data growth.
+ * <p>
  * Requires a MongoDB replica set (standalone does not support change streams).
  */
 public class MongoEventStore implements EventStore {
@@ -65,6 +73,8 @@ public class MongoEventStore implements EventStore {
             LoggerFactory.getLogger(MongoEventStore.class);
 
     private static final String DEFAULT_COLLECTION_PREFIX = "socketio_events_";
+    private static final long DEFAULT_TTL_SECONDS = 60;
+    private static final long POLL_INTERVAL_MS = 100;
 
     private static final ObjectMapper MAPPER;
 
@@ -73,11 +83,11 @@ public class MongoEventStore implements EventStore {
         MAPPER.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     }
 
-    private final MongoClient mongoClient;
     private final MongoDatabase database;
     private final Long nodeId;
     private final EventStoreMode eventStoreMode;
     private final String collectionPrefix;
+    private final long ttlSeconds;
 
     private final ConcurrentMap<EventType, Queue<WatcherHandle>> watchers =
             new ConcurrentHashMap<>();
@@ -89,27 +99,30 @@ public class MongoEventStore implements EventStore {
                 return t;
             });
 
+    /**
+     * Creates a new MongoEventStore.
+     *
+     * @param mongoClient      shared MongoDB client
+     * @param databaseName     database to use for event collections
+     * @param eventStoreMode   SINGLE_CHANNEL or MULTI_CHANNEL (defaults to MULTI_CHANNEL)
+     * @param nodeId           node identifier used to ignore self-published events
+     * @param collectionPrefix prefix for collection names (defaults to "socketio_events_")
+     * @param ttlSeconds       TTL in seconds for automatic document expiry (defaults to 60)
+     */
     public MongoEventStore(@NotNull MongoClient mongoClient,
                            @NotNull String databaseName,
                            @Nullable EventStoreMode eventStoreMode,
                            @Nullable Long nodeId,
-                           @Nullable String collectionPrefix) {
-        this.mongoClient = Objects.requireNonNull(mongoClient, "mongoClient");
+                           @Nullable String collectionPrefix,
+                           long ttlSeconds) {
+        Objects.requireNonNull(mongoClient, "mongoClient");
         this.database = mongoClient.getDatabase(
                 Objects.requireNonNull(databaseName, "databaseName"));
 
-        if (nodeId == null) {
-            nodeId = getNodeId();
-        }
-        this.nodeId = nodeId;
-
-        if (eventStoreMode == null) {
-            eventStoreMode = EventStoreMode.MULTI_CHANNEL;
-        }
-        this.eventStoreMode = eventStoreMode;
-
-        this.collectionPrefix = collectionPrefix != null
-                ? collectionPrefix : DEFAULT_COLLECTION_PREFIX;
+        this.nodeId = nodeId != null ? nodeId : getNodeId();
+        this.eventStoreMode = eventStoreMode != null ? eventStoreMode : EventStoreMode.MULTI_CHANNEL;
+        this.collectionPrefix = collectionPrefix != null ? collectionPrefix : DEFAULT_COLLECTION_PREFIX;
+        this.ttlSeconds = ttlSeconds > 0 ? ttlSeconds : DEFAULT_TTL_SECONDS;
     }
 
     @Override
@@ -131,18 +144,20 @@ public class MongoEventStore implements EventStore {
     public void publish0(EventType type, EventMessage msg) {
         msg.setNodeId(nodeId);
 
+        String collectionName = getCollectionName(type);
+        MongoCollection<Document> collection = database.getCollection(collectionName);
+        byte[] data;
         try {
-            String collectionName = getCollectionName(type);
-            MongoCollection<Document> collection = database.getCollection(collectionName);
-            byte[] data = MAPPER.writeValueAsBytes(msg);
-            Document doc = new Document()
-                    .append("nodeId", nodeId)
-                    .append("eventType", type.name())
-                    .append("payload", new String(data, "UTF-8"));
-            collection.insertOne(doc);
+            data = MAPPER.writeValueAsBytes(msg);
         } catch (Exception e) {
-            log.warn("Failed to publish event {}", type, e);
+            throw new RuntimeException("Failed to serialize EventMessage", e);
         }
+        Document doc = new Document()
+                .append("nodeId", nodeId)
+                .append("eventType", type.name())
+                .append("createdAt", new Date())
+                .append("payload", new String(data, StandardCharsets.UTF_8));
+        collection.insertOne(doc);
     }
 
     @Override
@@ -154,23 +169,43 @@ public class MongoEventStore implements EventStore {
         String collectionName = getCollectionName(type);
         MongoCollection<Document> collection = database.getCollection(collectionName);
 
+        ensureTtlIndex(collection);
+
         WatcherHandle handle = new WatcherHandle();
 
         watcherExecutor.submit(() -> {
             while (!handle.stopped.get()) {
+                MongoCursor<ChangeStreamDocument<Document>> cursor = null;
                 try {
-                    ChangeStreamIterable<Document> changeStream = collection.watch()
-                            .fullDocument(FullDocument.UPDATE_LOOKUP);
+                    cursor = collection.watch().cursor();
+                    handle.setCursor(cursor);
 
-                    for (ChangeStreamDocument<Document> change : changeStream) {
-                        if (handle.stopped.get()) {
-                            break;
+                    while (!handle.stopped.get()) {
+                        ChangeStreamDocument<Document> change = cursor.tryNext();
+                        if (change == null) {
+                            Thread.sleep(POLL_INTERVAL_MS);
+                            continue;
                         }
+
+                        if (change.getOperationType() != OperationType.INSERT) {
+                            continue;
+                        }
+
                         if (change.getFullDocument() == null) {
                             continue;
                         }
+
                         try {
                             Document doc = change.getFullDocument();
+
+                            if (EventStoreMode.MULTI_CHANNEL.equals(eventStoreMode)) {
+                                String eventTypeName = doc.getString("eventType");
+                                if (eventTypeName != null
+                                        && !type.name().equals(eventTypeName)) {
+                                    continue;
+                                }
+                            }
+
                             String payload = doc.getString("payload");
                             if (payload == null) {
                                 continue;
@@ -183,6 +218,9 @@ public class MongoEventStore implements EventStore {
                             log.warn("Failed to process change event on {}", collectionName, e);
                         }
                     }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 } catch (Exception e) {
                     if (!handle.stopped.get()) {
                         log.warn("Change stream interrupted on {}, reconnecting...",
@@ -194,6 +232,9 @@ public class MongoEventStore implements EventStore {
                             break;
                         }
                     }
+                } finally {
+                    closeCursorQuietly(cursor);
+                    handle.setCursor(null);
                 }
             }
         });
@@ -209,7 +250,7 @@ public class MongoEventStore implements EventStore {
             return;
         }
         for (WatcherHandle handle : handles) {
-            handle.stopped.set(true);
+            handle.stop();
         }
     }
 
@@ -228,6 +269,18 @@ public class MongoEventStore implements EventStore {
         }
     }
 
+    private void ensureTtlIndex(MongoCollection<Document> collection) {
+        try {
+            collection.createIndex(
+                    Indexes.ascending("createdAt"),
+                    new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
+            );
+        } catch (Exception e) {
+            log.debug("TTL index already exists or creation skipped on {}: {}",
+                    collection.getNamespace(), e.getMessage());
+        }
+    }
+
     private String getCollectionName(EventType type) {
         if (EventStoreMode.SINGLE_CHANNEL.equals(eventStoreMode)) {
             return collectionPrefix + EventType.ALL_SINGLE_CHANNEL.name();
@@ -235,10 +288,33 @@ public class MongoEventStore implements EventStore {
         return collectionPrefix + type.name();
     }
 
-    private static final class WatcherHandle {
-        final AtomicBoolean stopped = new AtomicBoolean(false);
+    private static void closeCursorQuietly(MongoCursor<?> cursor) {
+        if (cursor != null) {
+            try {
+                cursor.close();
+            } catch (Exception e) {
+                // ignore
+            }
+        }
     }
 
+    private static final class WatcherHandle {
+        final AtomicBoolean stopped = new AtomicBoolean(false);
+        private volatile MongoCursor<?> cursor;
+
+        void setCursor(MongoCursor<?> cursor) {
+            this.cursor = cursor;
+        }
+
+        void stop() {
+            stopped.set(true);
+            closeCursorQuietly(cursor);
+        }
+    }
+
+    /**
+     * Builder for {@link MongoEventStore}.
+     */
     public static final class Builder {
 
         private final MongoClient mongoClient;
@@ -247,7 +323,14 @@ public class MongoEventStore implements EventStore {
         private Long nodeId;
         private EventStoreMode eventStoreMode = EventStoreMode.MULTI_CHANNEL;
         private String collectionPrefix;
+        private long ttlSeconds = DEFAULT_TTL_SECONDS;
 
+        /**
+         * Creates a new builder.
+         *
+         * @param mongoClient  shared MongoDB client (must connect to a replica set)
+         * @param databaseName database to use for event collections
+         */
         public Builder(@NotNull MongoClient mongoClient, @NotNull String databaseName) {
             this.mongoClient = Objects.requireNonNull(mongoClient, "mongoClient");
             this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
@@ -268,13 +351,27 @@ public class MongoEventStore implements EventStore {
             return this;
         }
 
+        /**
+         * Sets the TTL in seconds for automatic document expiry.
+         * Documents older than this are automatically removed by MongoDB.
+         * Default is 60 seconds.
+         *
+         * @param ttlSeconds retention period in seconds
+         * @return this builder
+         */
+        public Builder ttlSeconds(long ttlSeconds) {
+            this.ttlSeconds = ttlSeconds;
+            return this;
+        }
+
         public MongoEventStore build() {
             return new MongoEventStore(
                     mongoClient,
                     databaseName,
                     eventStoreMode,
                     nodeId,
-                    collectionPrefix
+                    collectionPrefix,
+                    ttlSeconds
             );
         }
     }

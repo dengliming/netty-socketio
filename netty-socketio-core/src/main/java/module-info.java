@@ -51,7 +51,6 @@ module netty.socketio.core {
   exports com.socketio4j.socketio.store.redis_stream;
   exports com.socketio4j.socketio.store.kafka;
   exports com.socketio4j.socketio.store.mongo;
-  exports com.socketio4j.socketio.store.nats_pubsub;
 
   // ============================================================
   // Reflective-only packages (not exported)

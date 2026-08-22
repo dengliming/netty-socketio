@@ -154,17 +154,17 @@ public class DistributedMongoMultiChannelMemoryTest extends DistributedCommonTes
 
     @AfterAll
     public void stop() {
-        if (mc1 != null) {
-            mc1.close();
-        }
-        if (mc2 != null) {
-            mc2.close();
-        }
         if (node1 != null) {
             node1.stop();
         }
         if (node2 != null) {
             node2.stop();
+        }
+        if (mc1 != null) {
+            mc1.close();
+        }
+        if (mc2 != null) {
+            mc2.close();
         }
         MONGO_CONTAINER.stop();
     }

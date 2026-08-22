@@ -85,7 +85,7 @@ public class CustomizedMongoContainer extends GenericContainer<CustomizedMongoCo
 
     public String getConnectionString() {
         return "mongodb://" + getHost() + ":" + getMappedPort(MONGO_PORT)
-                + "/?directConnection=true";
+                + "/?replicaSet=rs0&directConnection=true";
     }
 
     public MongoClient createClient() {
