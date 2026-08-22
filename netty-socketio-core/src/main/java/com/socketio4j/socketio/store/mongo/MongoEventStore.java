@@ -24,6 +24,7 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -74,7 +75,7 @@ public class MongoEventStore implements EventStore {
 
     private static final String DEFAULT_COLLECTION_PREFIX = "socketio_events_";
     private static final long DEFAULT_TTL_SECONDS = 60;
-    private static final long POLL_INTERVAL_MS = 100;
+    private static final long WATCH_STARTUP_TIMEOUT_SECONDS = 10;
 
     private static final ObjectMapper MAPPER;
 
@@ -172,20 +173,23 @@ public class MongoEventStore implements EventStore {
         ensureTtlIndex(collection);
 
         WatcherHandle handle = new WatcherHandle();
+        // Opening the change stream is async, but events published before the
+        // cursor exists are lost. Let subscribe0 block until it is open.
+        CountDownLatch opened = new CountDownLatch(1);
 
         watcherExecutor.submit(() -> {
             while (!handle.stopped.get()) {
-                MongoCursor<ChangeStreamDocument<Document>> cursor = null;
-                try {
-                    cursor = collection.watch().cursor();
+                try (MongoCursor<ChangeStreamDocument<Document>> cursor =
+                             collection.watch().cursor()) {
                     handle.setCursor(cursor);
+                    opened.countDown();
 
-                    while (!handle.stopped.get()) {
-                        ChangeStreamDocument<Document> change = cursor.tryNext();
-                        if (change == null) {
-                            Thread.sleep(POLL_INTERVAL_MS);
-                            continue;
+                    while (!handle.stopped.get() && cursor.hasNext()) {
+                        if (handle.stopped.get()) {
+                            break;
                         }
+
+                        ChangeStreamDocument<Document> change = cursor.next();
 
                         if (change.getOperationType() != OperationType.INSERT) {
                             continue;
@@ -218,9 +222,6 @@ public class MongoEventStore implements EventStore {
                             log.warn("Failed to process change event on {}", collectionName, e);
                         }
                     }
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
                 } catch (Exception e) {
                     if (!handle.stopped.get()) {
                         log.warn("Change stream interrupted on {}, reconnecting...",
@@ -233,7 +234,8 @@ public class MongoEventStore implements EventStore {
                         }
                     }
                 } finally {
-                    closeCursorQuietly(cursor);
+                    // Never leave subscribe0 blocked if the stream failed to open.
+                    opened.countDown();
                     handle.setCursor(null);
                 }
             }
@@ -241,6 +243,16 @@ public class MongoEventStore implements EventStore {
 
         watchers.computeIfAbsent(type, k -> new ConcurrentLinkedQueue<>())
                 .add(handle);
+
+        try {
+            if (!opened.await(WATCH_STARTUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                log.warn("Change stream on {} not established within {}s; "
+                                + "early events may be missed",
+                        collectionName, WATCH_STARTUP_TIMEOUT_SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -269,6 +281,15 @@ public class MongoEventStore implements EventStore {
         }
     }
 
+    /**
+     * Creates the TTL index used to expire published events.
+     * <p>
+     * {@code createIndex} is idempotent for an identical index, so a failure here
+     * is a real problem — an options conflict with an existing {@code createdAt}
+     * index (a changed {@code ttlSeconds}) or missing privileges. Events then never
+     * expire and the collection grows without bound, so log it at warn rather than
+     * hiding it; subscription itself still works, so this must not abort startup.
+     */
     private void ensureTtlIndex(MongoCollection<Document> collection) {
         try {
             collection.createIndex(
@@ -276,8 +297,8 @@ public class MongoEventStore implements EventStore {
                     new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
             );
         } catch (Exception e) {
-            log.debug("TTL index already exists or creation skipped on {}: {}",
-                    collection.getNamespace(), e.getMessage());
+            log.warn("Failed to create TTL index on {}; published events may never expire",
+                    collection.getNamespace(), e);
         }
     }
 
@@ -300,15 +321,25 @@ public class MongoEventStore implements EventStore {
 
     private static final class WatcherHandle {
         final AtomicBoolean stopped = new AtomicBoolean(false);
-        private volatile MongoCursor<?> cursor;
+        private MongoCursor<?> cursor;
 
-        void setCursor(MongoCursor<?> cursor) {
+        /**
+         * Publishes the cursor so {@link #stop()} can close it and unblock
+         * {@code hasNext()}. If stop already happened, closes it right away —
+         * otherwise the watcher would block on a cursor nobody can close.
+         */
+        synchronized void setCursor(MongoCursor<?> cursor) {
+            if (cursor != null && stopped.get()) {
+                closeCursorQuietly(cursor);
+                return;
+            }
             this.cursor = cursor;
         }
 
-        void stop() {
+        synchronized void stop() {
             stopped.set(true);
             closeCursorQuietly(cursor);
+            cursor = null;
         }
     }
 
