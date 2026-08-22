@@ -1,0 +1,171 @@
+/**
+ * Copyright (c) 2025 The Socketio4j Project
+ * Parent project : Copyright (c) 2012-2025 Nikita Koksharov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.socketio4j.socketio.integration;
+
+import java.net.ServerSocket;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.TestInstance;
+
+import com.mongodb.client.MongoClient;
+
+import com.socketio4j.socketio.Configuration;
+import com.socketio4j.socketio.SocketIOServer;
+import com.socketio4j.socketio.store.CustomizedMongoContainer;
+import com.socketio4j.socketio.store.event.EventStoreMode;
+import com.socketio4j.socketio.store.memory.MemoryStoreFactory;
+import com.socketio4j.socketio.store.mongo.MongoEventStore;
+
+
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+public class DistributedMongoMultiChannelMemoryTest extends DistributedCommonTest {
+
+    private static final CustomizedMongoContainer MONGO_CONTAINER =
+            new CustomizedMongoContainer();
+
+    private static final String DB_NAME = "socketio_test";
+
+    private MongoClient mc1;
+    private MongoClient mc2;
+
+    private int findAvailablePort() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
+
+    @BeforeAll
+    public void setup() throws Exception {
+
+        MONGO_CONTAINER.start();
+
+        // ---------- NODE 1 ----------
+        Configuration cfg1 = new Configuration();
+        DistributedClusterIntegrationSupport.applyReuseListenAddress(cfg1);
+        cfg1.setHostname("127.0.0.1");
+        cfg1.setPort(findAvailablePort());
+
+        mc1 = MONGO_CONTAINER.createClient();
+        cfg1.setStoreFactory(
+                new MemoryStoreFactory(
+                        new MongoEventStore.Builder(mc1, DB_NAME)
+                                .eventStoreMode(EventStoreMode.MULTI_CHANNEL)
+                                .build()
+                )
+        );
+
+        node1 = new SocketIOServer(cfg1);
+        node1.addEventListener("join-room", String.class, (c, room, ack) -> {
+            c.joinRoom(room);
+            c.sendEvent("join-ok", "OK");
+        });
+        node1.addEventListener("leave-room", String.class, (c, room, ack) -> {
+            c.leaveRoom(room);
+            c.sendEvent("leave-ok", "OK");
+        });
+        node1.addEventListener("get-my-rooms", String.class, (client, data, ackSender) -> {
+            if (ackSender.isAckRequested()) {
+                ackSender.sendAckData(client.getAllRooms());
+            }
+        });
+        node1.addConnectListener(client -> {
+            Map<String, List<String>> params =
+                    client.getHandshakeData().getUrlParams();
+            List<String> joinParams = params.get("join");
+            if (joinParams == null || joinParams.isEmpty()) {
+                return;
+            }
+            Set<String> rooms = joinParams.stream()
+                    .flatMap(v -> Arrays.stream(v.split(",")))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toSet());
+            rooms.forEach(client::joinRoom);
+        });
+        node1.start();
+        port1 = cfg1.getPort();
+
+        // ---------- NODE 2 ----------
+        Configuration cfg2 = new Configuration();
+        DistributedClusterIntegrationSupport.applyReuseListenAddress(cfg2);
+        cfg2.setHostname("127.0.0.1");
+        cfg2.setPort(findAvailablePort());
+
+        mc2 = MONGO_CONTAINER.createClient();
+        cfg2.setStoreFactory(
+                new MemoryStoreFactory(
+                        new MongoEventStore.Builder(mc2, DB_NAME)
+                                .eventStoreMode(EventStoreMode.MULTI_CHANNEL)
+                                .build()
+                )
+        );
+
+        node2 = new SocketIOServer(cfg2);
+        node2.addEventListener("join-room", String.class, (c, room, ack) -> {
+            c.joinRoom(room);
+            c.sendEvent("join-ok", "OK");
+        });
+        node2.addEventListener("leave-room", String.class, (c, room, ack) -> {
+            c.leaveRoom(room);
+            c.sendEvent("leave-ok", "OK");
+        });
+        node2.addEventListener("get-my-rooms", String.class, (client, data, ackSender) -> {
+            if (ackSender.isAckRequested()) {
+                ackSender.sendAckData(client.getAllRooms());
+            }
+        });
+        node2.addConnectListener(client -> {
+            Map<String, List<String>> params =
+                    client.getHandshakeData().getUrlParams();
+            List<String> joinParams = params.get("join");
+            if (joinParams == null || joinParams.isEmpty()) {
+                return;
+            }
+            Set<String> rooms = joinParams.stream()
+                    .flatMap(v -> Arrays.stream(v.split(",")))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toSet());
+            rooms.forEach(client::joinRoom);
+        });
+        node2.start();
+        port2 = cfg2.getPort();
+    }
+
+    @AfterAll
+    public void stop() {
+        if (mc1 != null) {
+            mc1.close();
+        }
+        if (mc2 != null) {
+            mc2.close();
+        }
+        if (node1 != null) {
+            node1.stop();
+        }
+        if (node2 != null) {
+            node2.stop();
+        }
+        MONGO_CONTAINER.stop();
+    }
+}

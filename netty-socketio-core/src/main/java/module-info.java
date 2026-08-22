@@ -50,6 +50,8 @@ module netty.socketio.core {
   exports com.socketio4j.socketio.store.redis_reliable;
   exports com.socketio4j.socketio.store.redis_stream;
   exports com.socketio4j.socketio.store.kafka;
+  exports com.socketio4j.socketio.store.mongo;
+  exports com.socketio4j.socketio.store.nats_pubsub;
 
   // ============================================================
   // Reflective-only packages (not exported)
@@ -74,6 +76,9 @@ module netty.socketio.core {
   requires static redisson;
   requires static io.nats.jnats;
   requires static kafka.clients;
+  requires static org.mongodb.bson;
+  requires static org.mongodb.driver.core;
+  requires static org.mongodb.driver.sync.client;
 
   // ============================================================
   // Optional Netty native transports — only if available
