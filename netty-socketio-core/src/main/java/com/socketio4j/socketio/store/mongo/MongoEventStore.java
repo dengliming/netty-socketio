@@ -179,11 +179,15 @@ public class MongoEventStore implements EventStore {
         // cursor exists are lost. Let subscribe0 block until it is open.
         CountDownLatch opened = new CountDownLatch(1);
 
-        // Register before submitting: a concurrent unsubscribe0 that ran in between
-        // would find no handle and leave the watcher delivering events afterwards.
-        Queue<WatcherHandle> handles =
-                watchers.computeIfAbsent(type, k -> new ConcurrentLinkedQueue<>());
-        handles.add(handle);
+        // Register before submitting, and in a single atomic map operation: with a
+        // separate computeIfAbsent + add, an unsubscribe0 dropping the queue in
+        // between would leave the watcher running but unregistered, still delivering
+        // events after unsubscribe.
+        watchers.compute(type, (k, queue) -> {
+            Queue<WatcherHandle> q = queue != null ? queue : new ConcurrentLinkedQueue<>();
+            q.add(handle);
+            return q;
+        });
 
         Runnable watcher = () -> {
             while (!handle.stopped.get()) {
@@ -253,7 +257,7 @@ public class MongoEventStore implements EventStore {
             watcherExecutor.submit(watcher);
         } catch (RuntimeException e) {
             // Nothing will ever run for this handle, so do not leave it registered.
-            handles.remove(handle);
+            unregister(type, handle);
             handle.stop();
             throw e;
         }
@@ -267,6 +271,17 @@ public class MongoEventStore implements EventStore {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Removes one handle from its type's queue atomically, so it cannot race with
+     * the {@code compute} in {@link #subscribe0} or the removal in {@link #unsubscribe0}.
+     */
+    private void unregister(EventType type, WatcherHandle handle) {
+        watchers.computeIfPresent(type, (k, queue) -> {
+            queue.remove(handle);
+            return queue.isEmpty() ? null : queue;
+        });
     }
 
     @Override

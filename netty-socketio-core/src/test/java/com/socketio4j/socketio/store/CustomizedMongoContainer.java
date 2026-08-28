@@ -66,15 +66,17 @@ public class CustomizedMongoContainer extends GenericContainer<CustomizedMongoCo
 
             long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
             while (System.currentTimeMillis() < deadline) {
-                // --quiet keeps banners out of stdout, and rs.status() throws until the
-                // set is initiated, so swallow that and compare the result exactly:
-                // a substring match would accept any output containing a "1".
+                // rs.initiate() only starts an election, so rs.status().ok == 1 does not
+                // yet mean this member can accept writes — wait for it to be PRIMARY.
+                // --quiet keeps banners out of stdout, hello() throws until the set is
+                // initiated (swallowed below), and the result is compared exactly: a
+                // substring match would accept any output that merely contains the value.
                 ExecResult status = execInContainer(
                         "mongosh", "--quiet", "--eval",
-                        "try { rs.status().ok } catch (e) { 0 }"
+                        "try { db.hello().isWritablePrimary } catch (e) { false }"
                 );
                 String out = status.getStdout().trim();
-                if ("1".equals(out)) {
+                if ("true".equals(out)) {
                     return;
                 }
                 Thread.sleep(500);
