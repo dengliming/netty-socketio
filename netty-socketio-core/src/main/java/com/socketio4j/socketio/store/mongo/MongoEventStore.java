@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
@@ -76,6 +77,9 @@ public class MongoEventStore implements EventStore {
     private static final String DEFAULT_COLLECTION_PREFIX = "socketio_events_";
     private static final long DEFAULT_TTL_SECONDS = 60;
     private static final long WATCH_STARTUP_TIMEOUT_SECONDS = 10;
+
+    /** MongoDB error code raised when an index exists with the same key but different options. */
+    private static final int INDEX_OPTIONS_CONFLICT = 85;
 
     private static final ObjectMapper MAPPER;
 
@@ -313,63 +317,46 @@ public class MongoEventStore implements EventStore {
     /**
      * Creates or reconciles the TTL index used to expire published events.
      * <p>
-     * {@code createIndex} is idempotent only for an identical index: against an
-     * existing {@code createdAt} index with a different {@code expireAfterSeconds}
-     * it fails with an index-options conflict and leaves the old retention period
-     * in place. So an existing index is inspected first and, when its TTL differs,
-     * updated in place with {@code collMod}.
+     * {@code createIndex} creates the collection when it does not exist yet and is a
+     * no-op for an identical index, but it never updates an existing {@code createdAt}
+     * index whose {@code expireAfterSeconds} differs — it fails with an index-options
+     * conflict and leaves the old retention period in place. That conflict is caught
+     * here and the TTL is changed in place with {@code collMod}.
      * <p>
-     * A failure here (missing privileges, an unsupported server) means events may
+     * Any other failure (missing privileges, an unsupported server) means events may
      * never expire and the collection grows without bound, so log it at warn rather
      * than hiding it; subscription itself still works, so this must not abort startup.
      */
     private void ensureTtlIndex(MongoCollection<Document> collection) {
         try {
-            Document existing = findCreatedAtIndex(collection);
-            if (existing == null) {
-                collection.createIndex(
-                        Indexes.ascending("createdAt"),
-                        new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
-                );
+            collection.createIndex(
+                    Indexes.ascending("createdAt"),
+                    new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
+            );
+        } catch (MongoCommandException e) {
+            if (e.getErrorCode() != INDEX_OPTIONS_CONFLICT) {
+                logTtlIndexFailure(collection, e);
                 return;
             }
-
-            Number current = existing.get("expireAfterSeconds", Number.class);
-            if (current != null && current.longValue() == ttlSeconds) {
-                return;
+            try {
+                database.runCommand(
+                        new Document("collMod", collection.getNamespace().getCollectionName())
+                                .append("index", new Document("keyPattern", new Document("createdAt", 1))
+                                        .append("expireAfterSeconds", ttlSeconds)));
+                log.info("Updated TTL index on {} to {} seconds",
+                        collection.getNamespace(), ttlSeconds);
+            } catch (Exception ce) {
+                logTtlIndexFailure(collection, ce);
             }
-
-            // createIndex would only raise an options conflict here, so change the
-            // existing index in place instead of recreating it.
-            database.runCommand(new Document("collMod", collection.getNamespace().getCollectionName())
-                    .append("index", new Document("keyPattern", new Document("createdAt", 1))
-                            .append("expireAfterSeconds", ttlSeconds)));
-            log.info("Updated TTL index on {} from {} to {} seconds",
-                    collection.getNamespace(), current, ttlSeconds);
         } catch (Exception e) {
-            log.warn("Failed to apply TTL index of {}s on {}; published events may never "
-                            + "expire or may use a stale retention period",
-                    ttlSeconds, collection.getNamespace(), e);
+            logTtlIndexFailure(collection, e);
         }
     }
 
-    /**
-     * Returns the existing index on exactly {@code {createdAt: 1}}, or {@code null}
-     * if the collection has none. Compound or descending indexes on {@code createdAt}
-     * are not the one created here, so they are ignored.
-     */
-    private static Document findCreatedAtIndex(MongoCollection<Document> collection) {
-        for (Document index : collection.listIndexes()) {
-            Document key = index.get("key", Document.class);
-            if (key == null || key.size() != 1) {
-                continue;
-            }
-            Object direction = key.get("createdAt");
-            if (direction instanceof Number && ((Number) direction).intValue() == 1) {
-                return index;
-            }
-        }
-        return null;
+    private void logTtlIndexFailure(MongoCollection<Document> collection, Exception e) {
+        log.warn("Failed to apply TTL index of {}s on {}; published events may never "
+                        + "expire or may use a stale retention period",
+                ttlSeconds, collection.getNamespace(), e);
     }
 
     /**
