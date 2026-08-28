@@ -167,6 +167,8 @@ public class MongoEventStore implements EventStore {
             final EventListener<T> listener,
             Class<T> clazz) {
 
+        validateSubscribe(type);
+
         String collectionName = getCollectionName(type);
         MongoCollection<Document> collection = database.getCollection(collectionName);
 
@@ -177,7 +179,13 @@ public class MongoEventStore implements EventStore {
         // cursor exists are lost. Let subscribe0 block until it is open.
         CountDownLatch opened = new CountDownLatch(1);
 
-        watcherExecutor.submit(() -> {
+        // Register before submitting: a concurrent unsubscribe0 that ran in between
+        // would find no handle and leave the watcher delivering events afterwards.
+        Queue<WatcherHandle> handles =
+                watchers.computeIfAbsent(type, k -> new ConcurrentLinkedQueue<>());
+        handles.add(handle);
+
+        Runnable watcher = () -> {
             while (!handle.stopped.get()) {
                 try (MongoCursor<ChangeStreamDocument<Document>> cursor =
                              collection.watch().cursor()) {
@@ -239,10 +247,16 @@ public class MongoEventStore implements EventStore {
                     handle.setCursor(null);
                 }
             }
-        });
+        };
 
-        watchers.computeIfAbsent(type, k -> new ConcurrentLinkedQueue<>())
-                .add(handle);
+        try {
+            watcherExecutor.submit(watcher);
+        } catch (RuntimeException e) {
+            // Nothing will ever run for this handle, so do not leave it registered.
+            handles.remove(handle);
+            handle.stop();
+            throw e;
+        }
 
         try {
             if (!opened.await(WATCH_STARTUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -282,23 +296,85 @@ public class MongoEventStore implements EventStore {
     }
 
     /**
-     * Creates the TTL index used to expire published events.
+     * Creates or reconciles the TTL index used to expire published events.
      * <p>
-     * {@code createIndex} is idempotent for an identical index, so a failure here
-     * is a real problem — an options conflict with an existing {@code createdAt}
-     * index (a changed {@code ttlSeconds}) or missing privileges. Events then never
-     * expire and the collection grows without bound, so log it at warn rather than
-     * hiding it; subscription itself still works, so this must not abort startup.
+     * {@code createIndex} is idempotent only for an identical index: against an
+     * existing {@code createdAt} index with a different {@code expireAfterSeconds}
+     * it fails with an index-options conflict and leaves the old retention period
+     * in place. So an existing index is inspected first and, when its TTL differs,
+     * updated in place with {@code collMod}.
+     * <p>
+     * A failure here (missing privileges, an unsupported server) means events may
+     * never expire and the collection grows without bound, so log it at warn rather
+     * than hiding it; subscription itself still works, so this must not abort startup.
      */
     private void ensureTtlIndex(MongoCollection<Document> collection) {
         try {
-            collection.createIndex(
-                    Indexes.ascending("createdAt"),
-                    new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
-            );
+            Document existing = findCreatedAtIndex(collection);
+            if (existing == null) {
+                collection.createIndex(
+                        Indexes.ascending("createdAt"),
+                        new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
+                );
+                return;
+            }
+
+            Number current = existing.get("expireAfterSeconds", Number.class);
+            if (current != null && current.longValue() == ttlSeconds) {
+                return;
+            }
+
+            // createIndex would only raise an options conflict here, so change the
+            // existing index in place instead of recreating it.
+            database.runCommand(new Document("collMod", collection.getNamespace().getCollectionName())
+                    .append("index", new Document("keyPattern", new Document("createdAt", 1))
+                            .append("expireAfterSeconds", ttlSeconds)));
+            log.info("Updated TTL index on {} from {} to {} seconds",
+                    collection.getNamespace(), current, ttlSeconds);
         } catch (Exception e) {
-            log.warn("Failed to create TTL index on {}; published events may never expire",
-                    collection.getNamespace(), e);
+            log.warn("Failed to apply TTL index of {}s on {}; published events may never "
+                            + "expire or may use a stale retention period",
+                    ttlSeconds, collection.getNamespace(), e);
+        }
+    }
+
+    /**
+     * Returns the existing index on exactly {@code {createdAt: 1}}, or {@code null}
+     * if the collection has none. Compound or descending indexes on {@code createdAt}
+     * are not the one created here, so they are ignored.
+     */
+    private static Document findCreatedAtIndex(MongoCollection<Document> collection) {
+        for (Document index : collection.listIndexes()) {
+            Document key = index.get("key", Document.class);
+            if (key == null || key.size() != 1) {
+                continue;
+            }
+            Object direction = key.get("createdAt");
+            if (direction instanceof Number && ((Number) direction).intValue() == 1) {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Rejects a subscription whose {@link EventType} does not match the configured mode.
+     * <p>
+     * In SINGLE_CHANNEL mode every event type shares one collection, so only the
+     * {@code ALL_SINGLE_CHANNEL} subscription — the one {@code BaseStoreFactory} opens —
+     * is meaningful; a per-type subscription would silently watch the shared collection
+     * and receive unrelated event types. Mirrors {@code RedisStreamEventStore}.
+     */
+    private void validateSubscribe(EventType type) {
+        if (EventStoreMode.SINGLE_CHANNEL.equals(eventStoreMode)
+                && type != EventType.ALL_SINGLE_CHANNEL) {
+            throw new UnsupportedOperationException(
+                    "Only ALL_SINGLE_CHANNEL allowed in SINGLE_CHANNEL mode");
+        }
+        if (EventStoreMode.MULTI_CHANNEL.equals(eventStoreMode)
+                && type == EventType.ALL_SINGLE_CHANNEL) {
+            throw new UnsupportedOperationException(
+                    "ALL_SINGLE_CHANNEL not allowed in MULTI_CHANNEL mode");
         }
     }
 

@@ -66,11 +66,15 @@ public class CustomizedMongoContainer extends GenericContainer<CustomizedMongoCo
 
             long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
             while (System.currentTimeMillis() < deadline) {
+                // --quiet keeps banners out of stdout, and rs.status() throws until the
+                // set is initiated, so swallow that and compare the result exactly:
+                // a substring match would accept any output containing a "1".
                 ExecResult status = execInContainer(
-                        "mongosh", "--eval", "rs.status().ok"
+                        "mongosh", "--quiet", "--eval",
+                        "try { rs.status().ok } catch (e) { 0 }"
                 );
                 String out = status.getStdout().trim();
-                if (out.contains("1")) {
+                if ("1".equals(out)) {
                     return;
                 }
                 Thread.sleep(500);
