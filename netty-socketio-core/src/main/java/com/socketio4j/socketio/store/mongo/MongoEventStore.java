@@ -36,7 +36,6 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoClient;
@@ -50,6 +49,7 @@ import com.mongodb.client.model.changestream.OperationType;
 
 import com.socketio4j.socketio.store.event.EventListener;
 import com.socketio4j.socketio.store.event.EventMessage;
+import com.socketio4j.socketio.store.event.EventMessageJsonSupport;
 import com.socketio4j.socketio.store.event.EventStore;
 import com.socketio4j.socketio.store.event.EventStoreMode;
 import com.socketio4j.socketio.store.event.EventStoreType;
@@ -81,12 +81,8 @@ public class MongoEventStore implements EventStore {
     /** MongoDB error code raised when an index exists with the same key but different options. */
     private static final int INDEX_OPTIONS_CONFLICT = 85;
 
-    private static final ObjectMapper MAPPER;
-
-    static {
-        MAPPER = new ObjectMapper();
-        MAPPER.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-    }
+    /** Shared mapper: keeps byte[] payloads lossless, as the Kafka and NATS stores do. */
+    private static final ObjectMapper MAPPER = EventMessageJsonSupport.createObjectMapper();
 
     private final MongoDatabase database;
     private final Long nodeId;
