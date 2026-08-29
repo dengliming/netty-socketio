@@ -18,7 +18,9 @@ package com.socketio4j.socketio.store.mongo;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,10 +29,12 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -38,15 +42,17 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.MongoCommandException;
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Aggregates;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.OperationType;
-
 import com.socketio4j.socketio.store.event.EventListener;
 import com.socketio4j.socketio.store.event.EventMessage;
 import com.socketio4j.socketio.store.event.EventMessageJsonSupport;
@@ -77,6 +83,14 @@ public class MongoEventStore implements EventStore {
     private static final String DEFAULT_COLLECTION_PREFIX = "socketio_events_";
     private static final long DEFAULT_TTL_SECONDS = 60;
     private static final long WATCH_STARTUP_TIMEOUT_SECONDS = 10;
+
+    /**
+     * Server-side filter for the change stream: only inserts carry published events, and
+     * TTL expiry deletes a batch of documents about once a minute — events every watcher
+     * would otherwise receive and decode only to drop.
+     */
+    private static final List<Bson> INSERT_ONLY = Collections.singletonList(
+            Aggregates.match(Filters.eq("operationType", "insert")));
 
     /** MongoDB error code raised when an index exists with the same key but different options. */
     private static final int INDEX_OPTIONS_CONFLICT = 85;
@@ -121,10 +135,26 @@ public class MongoEventStore implements EventStore {
         this.database = mongoClient.getDatabase(
                 Objects.requireNonNull(databaseName, "databaseName"));
 
-        this.nodeId = nodeId != null ? nodeId : getNodeId();
-        this.eventStoreMode = eventStoreMode != null ? eventStoreMode : EventStoreMode.MULTI_CHANNEL;
-        this.collectionPrefix = collectionPrefix != null ? collectionPrefix : DEFAULT_COLLECTION_PREFIX;
-        this.ttlSeconds = ttlSeconds > 0 ? ttlSeconds : DEFAULT_TTL_SECONDS;
+        if (nodeId != null) {
+            this.nodeId = nodeId;
+        } else {
+            this.nodeId = getNodeId();
+        }
+        if (eventStoreMode != null) {
+            this.eventStoreMode = eventStoreMode;
+        } else {
+            this.eventStoreMode = EventStoreMode.MULTI_CHANNEL;
+        }
+        if (collectionPrefix != null) {
+            this.collectionPrefix = collectionPrefix;
+        } else {
+            this.collectionPrefix = DEFAULT_COLLECTION_PREFIX;
+        }
+        if (ttlSeconds > 0) {
+            this.ttlSeconds = ttlSeconds;
+        } else {
+            this.ttlSeconds = DEFAULT_TTL_SECONDS;
+        }
     }
 
     @Override
@@ -185,7 +215,10 @@ public class MongoEventStore implements EventStore {
         // between would leave the watcher running but unregistered, still delivering
         // events after unsubscribe.
         watchers.compute(type, (k, queue) -> {
-            Queue<WatcherHandle> q = queue != null ? queue : new ConcurrentLinkedQueue<>();
+            Queue<WatcherHandle> q = queue;
+            if (q == null) {
+                q = new ConcurrentLinkedQueue<>();
+            }
             q.add(handle);
             return q;
         });
@@ -193,7 +226,7 @@ public class MongoEventStore implements EventStore {
         Runnable watcher = () -> {
             while (!handle.stopped.get()) {
                 try (MongoCursor<ChangeStreamDocument<Document>> cursor =
-                             collection.watch().cursor()) {
+                             collection.watch(INSERT_ONLY).cursor()) {
                     handle.setCursor(cursor);
                     opened.countDown();
 
@@ -255,7 +288,7 @@ public class MongoEventStore implements EventStore {
 
         try {
             watcherExecutor.submit(watcher);
-        } catch (RuntimeException e) {
+        } catch (RejectedExecutionException e) {
             // Nothing will ever run for this handle, so do not leave it registered.
             unregister(type, handle);
             handle.stop();
@@ -280,7 +313,10 @@ public class MongoEventStore implements EventStore {
     private void unregister(EventType type, WatcherHandle handle) {
         watchers.computeIfPresent(type, (k, queue) -> {
             queue.remove(handle);
-            return queue.isEmpty() ? null : queue;
+            if (queue.isEmpty()) {
+                return null;
+            }
+            return queue;
         });
     }
 
@@ -341,10 +377,10 @@ public class MongoEventStore implements EventStore {
                                         .append("expireAfterSeconds", ttlSeconds)));
                 log.info("Updated TTL index on {} to {} seconds",
                         collection.getNamespace(), ttlSeconds);
-            } catch (RuntimeException ce) {
+            } catch (MongoException ce) {
                 throw ttlIndexFailure(collection, ce);
             }
-        } catch (RuntimeException e) {
+        } catch (MongoException e) {
             throw ttlIndexFailure(collection, e);
         }
     }

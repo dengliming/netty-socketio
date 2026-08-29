@@ -40,7 +40,7 @@ public class CustomizedMongoContainer extends GenericContainer<CustomizedMongoCo
     private static final int MONGO_PORT = 27017;
 
     public CustomizedMongoContainer() {
-        super(DockerImageName.parse("mongo:7.0"));
+        super(DockerImageName.parse("mongo:7.0.40"));
 
         withExposedPorts(MONGO_PORT);
         withCommand("--replSet", "rs0");
