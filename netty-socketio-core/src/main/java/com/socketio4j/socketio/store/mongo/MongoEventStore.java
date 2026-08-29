@@ -323,9 +323,10 @@ public class MongoEventStore implements EventStore {
      * conflict and leaves the old retention period in place. That conflict is caught
      * here and the TTL is changed in place with {@code collMod}.
      * <p>
-     * Any other failure (missing privileges, an unsupported server) means events may
-     * never expire and the collection grows without bound, so log it at warn rather
-     * than hiding it; subscription itself still works, so this must not abort startup.
+     * Any other failure (missing privileges, an unsupported server) aborts the
+     * subscription: without the index, published events never expire and the collection
+     * grows without bound, which is an operational problem an operator must see rather
+     * than find later in a full database.
      */
     private void ensureTtlIndex(MongoCollection<Document> collection) {
         try {
@@ -335,8 +336,7 @@ public class MongoEventStore implements EventStore {
             );
         } catch (MongoCommandException e) {
             if (e.getErrorCode() != INDEX_OPTIONS_CONFLICT) {
-                logTtlIndexFailure(collection, e);
-                return;
+                throw ttlIndexFailure(collection, e);
             }
             try {
                 database.runCommand(
@@ -345,18 +345,18 @@ public class MongoEventStore implements EventStore {
                                         .append("expireAfterSeconds", ttlSeconds)));
                 log.info("Updated TTL index on {} to {} seconds",
                         collection.getNamespace(), ttlSeconds);
-            } catch (Exception ce) {
-                logTtlIndexFailure(collection, ce);
+            } catch (RuntimeException ce) {
+                throw ttlIndexFailure(collection, ce);
             }
-        } catch (Exception e) {
-            logTtlIndexFailure(collection, e);
+        } catch (RuntimeException e) {
+            throw ttlIndexFailure(collection, e);
         }
     }
 
-    private void logTtlIndexFailure(MongoCollection<Document> collection, Exception e) {
-        log.warn("Failed to apply TTL index of {}s on {}; published events may never "
-                        + "expire or may use a stale retention period",
-                ttlSeconds, collection.getNamespace(), e);
+    private IllegalStateException ttlIndexFailure(MongoCollection<Document> collection, Exception cause) {
+        return new IllegalStateException("Failed to apply the TTL index of " + ttlSeconds
+                + "s on " + collection.getNamespace()
+                + "; published events would never expire", cause);
     }
 
     /**
