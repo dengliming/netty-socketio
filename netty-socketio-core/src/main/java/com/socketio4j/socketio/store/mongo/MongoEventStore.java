@@ -99,7 +99,8 @@ public class MongoEventStore implements EventStore {
 
     private final ExecutorService watcherExecutor =
             Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "socketio-mongo-watcher");
+                Thread t = new Thread(r);
+                t.setName("socketio-mongo-watcher-" + t.getId());
                 t.setDaemon(true);
                 return t;
             });
