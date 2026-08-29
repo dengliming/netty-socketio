@@ -250,8 +250,7 @@ public class MongoEventStore implements EventStore {
                         }
                     }
                 } finally {
-                    // Never leave subscribe0 blocked if the stream failed to open.
-                    opened.countDown();
+                    // Clear the cursor; subscribe0 uses a startup timeout to avoid blocking indefinitely.
                     handle.setCursor(null);
                 }
             }
