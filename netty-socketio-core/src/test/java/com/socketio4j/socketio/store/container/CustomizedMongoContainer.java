@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.socketio4j.socketio.store;
+package com.socketio4j.socketio.store.container;
 
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
