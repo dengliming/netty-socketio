@@ -229,6 +229,9 @@ public class MongoEventStore implements EventStore {
             final EventListener<T> listener,
             Class<T> clazz) {
 
+        Objects.requireNonNull(listener);
+        Objects.requireNonNull(clazz);
+
         validateSubscribe(type);
 
         String collectionName = getCollectionName(type);
@@ -562,6 +565,12 @@ public class MongoEventStore implements EventStore {
                 return;
             }
 
+            // A node sees its own inserts too, so drop them on the document's own nodeId
+            // rather than paying for the deserialization first.
+            if (nodeId.equals(doc.get("nodeId"))) {
+                return;
+            }
+
             if (EventStoreMode.MULTI_CHANNEL.equals(eventStoreMode)) {
                 String eventTypeName = doc.getString("eventType");
                 if (eventTypeName != null && !type.name().equals(eventTypeName)) {
@@ -576,6 +585,8 @@ public class MongoEventStore implements EventStore {
 
             try {
                 T event = MAPPER.readValue(payload, clazz);
+                // Belt and braces: a document written without the nodeId field still gets
+                // filtered on the value carried by the event itself.
                 if (!nodeId.equals(event.getNodeId())) {
                     listener.onMessage(event);
                 }
