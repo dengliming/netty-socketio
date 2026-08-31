@@ -17,6 +17,7 @@
 package com.socketio4j.socketio.store.mongo;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
@@ -27,6 +28,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -100,6 +102,14 @@ public class MongoEventStore implements EventStore {
 
     /** How long to wait before reopening a change stream that ended or failed. */
     private static final long REOPEN_DELAY_MILLIS = 1000;
+
+    /**
+     * How long {@link #shutdown0()} waits for cancelled change streams to actually end.
+     * Cancelling is asynchronous, and the driver may still have a {@code getMore} in flight;
+     * if the caller closes its {@code MongoClient} before that lands, the cursor tries to
+     * resume against a closed cluster and the driver logs a failure per stream.
+     */
+    private static final long CANCEL_GRACE_MILLIS = 1000;
 
     /**
      * Server-side filter for the change stream: only inserts carry published events, and
@@ -298,8 +308,15 @@ public class MongoEventStore implements EventStore {
 
     @Override
     public void shutdown0() {
+        List<WatcherHandle> cancelled = new ArrayList<WatcherHandle>();
+        for (Queue<WatcherHandle> handles : watchers.values()) {
+            cancelled.addAll(handles);
+        }
+
         Arrays.stream(EventType.values()).forEach(this::unsubscribe);
         watchers.clear();
+        awaitCancellation(cancelled);
+
         watcherExecutor.shutdown();
         try {
             if (!watcherExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -307,6 +324,31 @@ public class MongoEventStore implements EventStore {
             }
         } catch (InterruptedException e) {
             watcherExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Waits for the change streams cancelled by {@link #shutdown0()} to end, so that a
+     * caller closing its {@code MongoClient} right afterwards does not interrupt them
+     * mid-flight. The driver is not required to signal a cancelled subscriber at all, so
+     * this is bounded by {@link #CANCEL_GRACE_MILLIS} and returns early when it does.
+     */
+    private void awaitCancellation(List<WatcherHandle> handles) {
+        if (handles.isEmpty()) {
+            return;
+        }
+
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CANCEL_GRACE_MILLIS);
+        try {
+            for (WatcherHandle handle : handles) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return;
+                }
+                handle.awaitTermination(remaining);
+            }
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
     }
@@ -545,6 +587,7 @@ public class MongoEventStore implements EventStore {
         @Override
         public void onError(Throwable error) {
             if (handle.stopped.get()) {
+                handle.markTerminated();
                 return;
             }
             log.warn("Change stream on {} failed, reopening...", collection.getNamespace(), error);
@@ -554,6 +597,7 @@ public class MongoEventStore implements EventStore {
         @Override
         public void onComplete() {
             if (handle.stopped.get()) {
+                handle.markTerminated();
                 return;
             }
             // The server ended the stream, for instance because the collection was dropped.
@@ -576,6 +620,7 @@ public class MongoEventStore implements EventStore {
 
         final AtomicBoolean stopped = new AtomicBoolean(false);
 
+        private final CountDownLatch terminated = new CountDownLatch(1);
         private final BsonTimestamp startAt;
         private Subscription subscription;
         private BsonDocument resumeToken;
@@ -614,7 +659,18 @@ public class MongoEventStore implements EventStore {
             if (subscription != null) {
                 subscription.cancel();
                 subscription = null;
+            } else {
+                // Nothing was ever opened, so there is nothing left to wait for.
+                terminated.countDown();
             }
+        }
+
+        void markTerminated() {
+            terminated.countDown();
+        }
+
+        void awaitTermination(long nanos) throws InterruptedException {
+            terminated.await(nanos, TimeUnit.NANOSECONDS);
         }
     }
 
