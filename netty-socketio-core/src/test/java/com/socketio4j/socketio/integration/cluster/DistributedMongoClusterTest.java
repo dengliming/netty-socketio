@@ -24,7 +24,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.ResourceLock;
 
-import com.mongodb.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoClient;
 
 import com.socketio4j.socketio.Configuration;
 import com.socketio4j.socketio.SocketIOServer;

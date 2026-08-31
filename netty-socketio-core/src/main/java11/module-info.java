@@ -80,7 +80,8 @@ module netty.socketio.core {
   requires static kafka.clients;
   requires static org.mongodb.bson;
   requires static org.mongodb.driver.core;
-  requires static org.mongodb.driver.sync.client;
+  requires static org.mongodb.driver.reactivestreams;
+  requires static org.reactivestreams;
 
   // ============================================================
   // Optional Netty native transports — only if available

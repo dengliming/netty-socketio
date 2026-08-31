@@ -145,7 +145,7 @@
     </dependency>
     <dependency>
       <groupId>org.mongodb</groupId>
-      <artifactId>mongodb-driver-sync</artifactId>
+      <artifactId>mongodb-driver-reactivestreams</artifactId>
       <scope>provided</scope>
     </dependency>
 

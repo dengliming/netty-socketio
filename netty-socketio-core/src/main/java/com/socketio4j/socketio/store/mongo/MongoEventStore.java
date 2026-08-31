@@ -23,36 +23,43 @@ import java.util.Date;
 import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.MongoCommandException;
 import com.mongodb.MongoException;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoCursor;
-import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
-import com.mongodb.client.model.changestream.OperationType;
+import com.mongodb.client.result.InsertOneResult;
+import com.mongodb.reactivestreams.client.ChangeStreamPublisher;
+import com.mongodb.reactivestreams.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoCollection;
+import com.mongodb.reactivestreams.client.MongoDatabase;
 import com.socketio4j.socketio.store.event.EventListener;
 import com.socketio4j.socketio.store.event.EventMessage;
 import com.socketio4j.socketio.store.event.EventMessageJsonSupport;
@@ -69,6 +76,11 @@ import com.socketio4j.socketio.store.event.PublishMode;
  * events to subscribers. Each event type maps to its own collection (MULTI_CHANNEL)
  * or all events go into one collection (SINGLE_CHANNEL).
  * <p>
+ * Built on the reactive streams driver: {@code publish0} is called from the Netty
+ * event loop, so the insert is handed to the driver and never waited on. Only the
+ * one-off setup done while subscribing (index creation, reading the cluster time)
+ * blocks, and that runs on the thread starting the server.
+ * <p>
  * A TTL index is created on each collection to automatically expire documents
  * after a configurable retention period (default 60 seconds), preventing
  * unbounded data growth.
@@ -82,7 +94,12 @@ public class MongoEventStore implements EventStore {
 
     private static final String DEFAULT_COLLECTION_PREFIX = "socketio_events_";
     private static final long DEFAULT_TTL_SECONDS = 60;
-    private static final long WATCH_STARTUP_TIMEOUT_SECONDS = 10;
+
+    /** How long a blocking setup command may take before subscribing is given up on. */
+    private static final long SETUP_TIMEOUT_SECONDS = 10;
+
+    /** How long to wait before reopening a change stream that ended or failed. */
+    private static final long REOPEN_DELAY_MILLIS = 1000;
 
     /**
      * Server-side filter for the change stream: only inserts carry published events, and
@@ -107,8 +124,8 @@ public class MongoEventStore implements EventStore {
     private final ConcurrentMap<EventType, Queue<WatcherHandle>> watchers =
             new ConcurrentHashMap<>();
 
-    private final ExecutorService watcherExecutor =
-            Executors.newCachedThreadPool(r -> {
+    private final ScheduledExecutorService watcherExecutor =
+            Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r);
                 t.setName("socketio-mongo-watcher-" + t.getId());
                 t.setDaemon(true);
@@ -177,19 +194,23 @@ public class MongoEventStore implements EventStore {
         msg.setNodeId(nodeId);
 
         String collectionName = getCollectionName(type);
-        MongoCollection<Document> collection = database.getCollection(collectionName);
         byte[] data;
         try {
             data = MAPPER.writeValueAsBytes(msg);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize EventMessage", e);
+            throw new IllegalStateException("Failed to serialize EventMessage", e);
         }
         Document doc = new Document()
                 .append("nodeId", nodeId)
                 .append("eventType", type.name())
                 .append("createdAt", new Date())
                 .append("payload", new String(data, StandardCharsets.UTF_8));
-        collection.insertOne(doc);
+
+        // Fire and forget: this runs on the Netty event loop, so the insert is handed to
+        // the driver and its outcome only logged, the model KafkaEventStore.publish0 uses.
+        database.getCollection(collectionName)
+                .insertOne(doc)
+                .subscribe(new PublishSubscriber(type, collectionName));
     }
 
     @Override
@@ -205,15 +226,15 @@ public class MongoEventStore implements EventStore {
 
         ensureTtlIndex(collection);
 
-        WatcherHandle handle = new WatcherHandle();
-        // Opening the change stream is async, but events published before the
-        // cursor exists are lost. Let subscribe0 block until it is open.
-        CountDownLatch opened = new CountDownLatch(1);
+        // The change stream opens asynchronously, so events published in between would be
+        // lost. Starting it at the operation time read here covers that window instead of
+        // making subscribe0 wait for a cursor it cannot observe.
+        WatcherHandle handle = new WatcherHandle(currentOperationTime());
 
-        // Register before submitting, and in a single atomic map operation: with a
-        // separate computeIfAbsent + add, an unsubscribe0 dropping the queue in
-        // between would leave the watcher running but unregistered, still delivering
-        // events after unsubscribe.
+        // Register before opening the stream, and in a single atomic map operation: with a
+        // separate computeIfAbsent + add, an unsubscribe0 dropping the queue in between
+        // would leave the watcher running but unregistered, still delivering events after
+        // unsubscribe.
         watchers.compute(type, (k, queue) -> {
             Queue<WatcherHandle> q = queue;
             if (q == null) {
@@ -223,87 +244,31 @@ public class MongoEventStore implements EventStore {
             return q;
         });
 
-        Runnable watcher = () -> {
-            while (!handle.stopped.get()) {
-                try (MongoCursor<ChangeStreamDocument<Document>> cursor =
-                             collection.watch(INSERT_ONLY).cursor()) {
-                    handle.setCursor(cursor);
-                    opened.countDown();
+        watch(collection, type, handle, listener, clazz);
+    }
 
-                    while (!handle.stopped.get() && cursor.hasNext()) {
-                        if (handle.stopped.get()) {
-                            break;
-                        }
-
-                        ChangeStreamDocument<Document> change = cursor.next();
-
-                        if (change.getOperationType() != OperationType.INSERT) {
-                            continue;
-                        }
-
-                        if (change.getFullDocument() == null) {
-                            continue;
-                        }
-
-                        try {
-                            Document doc = change.getFullDocument();
-
-                            if (EventStoreMode.MULTI_CHANNEL.equals(eventStoreMode)) {
-                                String eventTypeName = doc.getString("eventType");
-                                if (eventTypeName != null
-                                        && !type.name().equals(eventTypeName)) {
-                                    continue;
-                                }
-                            }
-
-                            String payload = doc.getString("payload");
-                            if (payload == null) {
-                                continue;
-                            }
-                            T event = MAPPER.readValue(payload, clazz);
-                            if (!nodeId.equals(event.getNodeId())) {
-                                listener.onMessage(event);
-                            }
-                        } catch (Exception e) {
-                            log.warn("Failed to process change event on {}", collectionName, e);
-                        }
-                    }
-                } catch (Exception e) {
-                    if (!handle.stopped.get()) {
-                        log.warn("Change stream interrupted on {}, reconnecting...",
-                                collectionName, e);
-                        try {
-                            Thread.sleep(1000);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                    }
-                } finally {
-                    // Clear the cursor; subscribe0 uses a startup timeout to avoid blocking indefinitely.
-                    handle.setCursor(null);
-                }
-            }
-        };
-
-        try {
-            watcherExecutor.submit(watcher);
-        } catch (RejectedExecutionException e) {
-            // Nothing will ever run for this handle, so do not leave it registered.
-            unregister(type, handle);
-            handle.stop();
-            throw e;
+    /**
+     * Opens the change stream, resuming after the last delivered event when this is a
+     * reopen, and otherwise starting at the operation time captured while subscribing.
+     */
+    private <T extends EventMessage> void watch(MongoCollection<Document> collection,
+                                                EventType type,
+                                                WatcherHandle handle,
+                                                EventListener<T> listener,
+                                                Class<T> clazz) {
+        if (handle.stopped.get()) {
+            return;
         }
 
-        try {
-            if (!opened.await(WATCH_STARTUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                log.warn("Change stream on {} not established within {}s; "
-                                + "early events may be missed",
-                        collectionName, WATCH_STARTUP_TIMEOUT_SECONDS);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        ChangeStreamPublisher<Document> stream = collection.watch(INSERT_ONLY);
+        BsonDocument resumeToken = handle.resumeToken();
+        if (resumeToken != null) {
+            stream = stream.resumeAfter(resumeToken);
+        } else if (handle.startAt() != null) {
+            stream = stream.startAtOperationTime(handle.startAt());
         }
+
+        stream.subscribe(new ChangeSubscriber<T>(collection, type, handle, listener, clazz));
     }
 
     /**
@@ -362,19 +327,19 @@ public class MongoEventStore implements EventStore {
      */
     private void ensureTtlIndex(MongoCollection<Document> collection) {
         try {
-            collection.createIndex(
+            await(collection.createIndex(
                     Indexes.ascending("createdAt"),
                     new IndexOptions().expireAfter(ttlSeconds, TimeUnit.SECONDS)
-            );
+            ));
         } catch (MongoCommandException e) {
             if (e.getErrorCode() != INDEX_OPTIONS_CONFLICT) {
                 throw ttlIndexFailure(collection, e);
             }
             try {
-                database.runCommand(
+                await(database.runCommand(
                         new Document("collMod", collection.getNamespace().getCollectionName())
                                 .append("index", new Document("keyPattern", new Document("createdAt", 1))
-                                        .append("expireAfterSeconds", ttlSeconds)));
+                                        .append("expireAfterSeconds", ttlSeconds))));
                 log.info("Updated TTL index on {} to {} seconds",
                         collection.getNamespace(), ttlSeconds);
             } catch (MongoException ce) {
@@ -389,6 +354,70 @@ public class MongoEventStore implements EventStore {
         return new IllegalStateException("Failed to apply the TTL index of " + ttlSeconds
                 + "s on " + collection.getNamespace()
                 + "; published events would never expire", cause);
+    }
+
+    /**
+     * Reads the server's current operation time, used as the change stream start point.
+     * Returns {@code null} when the deployment does not report one, in which case the
+     * stream simply starts at whatever the server considers now.
+     */
+    private BsonTimestamp currentOperationTime() {
+        Document result = await(database.runCommand(new Document("ping", 1)));
+        if (result == null) {
+            return null;
+        }
+        Object operationTime = result.get("operationTime");
+        if (operationTime instanceof BsonTimestamp) {
+            return (BsonTimestamp) operationTime;
+        }
+        return null;
+    }
+
+    /**
+     * Subscribes to a one-shot publisher and waits for it, so the setup done while
+     * subscribing keeps its ordering and its failures. Never called from the event loop.
+     */
+    private static <T> T await(Publisher<T> publisher) {
+        final CompletableFuture<T> future = new CompletableFuture<T>();
+        publisher.subscribe(new Subscriber<T>() {
+            private T value;
+
+            @Override
+            public void onSubscribe(Subscription subscription) {
+                subscription.request(1);
+            }
+
+            @Override
+            public void onNext(T item) {
+                value = item;
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                future.completeExceptionally(error);
+            }
+
+            @Override
+            public void onComplete() {
+                future.complete(value);
+            }
+        });
+
+        try {
+            return future.get(SETUP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for MongoDB", e);
+        } catch (TimeoutException e) {
+            throw new IllegalStateException(
+                    "MongoDB did not respond within " + SETUP_TIMEOUT_SECONDS + "s", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IllegalStateException("MongoDB command failed", cause);
+        }
     }
 
     /**
@@ -419,37 +448,173 @@ public class MongoEventStore implements EventStore {
         return collectionPrefix + type.name();
     }
 
-    private static void closeCursorQuietly(MongoCursor<?> cursor) {
-        if (cursor != null) {
+    /** Logs a failed insert; a published event is never retried, as in the Kafka store. */
+    private static final class PublishSubscriber implements Subscriber<InsertOneResult> {
+
+        private final EventType type;
+        private final String collectionName;
+
+        PublishSubscriber(EventType type, String collectionName) {
+            this.type = type;
+            this.collectionName = collectionName;
+        }
+
+        @Override
+        public void onSubscribe(Subscription subscription) {
+            subscription.request(1);
+        }
+
+        @Override
+        public void onNext(InsertOneResult result) {
+            // the insert result carries nothing this store needs
+        }
+
+        @Override
+        public void onError(Throwable error) {
+            log.warn("Failed to publish {} to {}", type, collectionName, error);
+        }
+
+        @Override
+        public void onComplete() {
+            // nothing to do
+        }
+    }
+
+    /**
+     * Delivers change events to one listener and reopens the stream when it ends, which
+     * replaces the reconnect loop a blocking cursor needed.
+     */
+    private final class ChangeSubscriber<T extends EventMessage>
+            implements Subscriber<ChangeStreamDocument<Document>> {
+
+        private final MongoCollection<Document> collection;
+        private final EventType type;
+        private final WatcherHandle handle;
+        private final EventListener<T> listener;
+        private final Class<T> clazz;
+
+        ChangeSubscriber(MongoCollection<Document> collection,
+                         EventType type,
+                         WatcherHandle handle,
+                         EventListener<T> listener,
+                         Class<T> clazz) {
+            this.collection = collection;
+            this.type = type;
+            this.handle = handle;
+            this.listener = listener;
+            this.clazz = clazz;
+        }
+
+        @Override
+        public void onSubscribe(Subscription subscription) {
+            handle.setSubscription(subscription);
+            subscription.request(Long.MAX_VALUE);
+        }
+
+        @Override
+        public void onNext(ChangeStreamDocument<Document> change) {
+            handle.setResumeToken(change.getResumeToken());
+
+            Document doc = change.getFullDocument();
+            if (doc == null) {
+                return;
+            }
+
+            if (EventStoreMode.MULTI_CHANNEL.equals(eventStoreMode)) {
+                String eventTypeName = doc.getString("eventType");
+                if (eventTypeName != null && !type.name().equals(eventTypeName)) {
+                    return;
+                }
+            }
+
+            String payload = doc.getString("payload");
+            if (payload == null) {
+                return;
+            }
+
             try {
-                cursor.close();
+                T event = MAPPER.readValue(payload, clazz);
+                if (!nodeId.equals(event.getNodeId())) {
+                    listener.onMessage(event);
+                }
             } catch (Exception e) {
-                // ignore
+                log.warn("Failed to process change event on {}", collection.getNamespace(), e);
+            }
+        }
+
+        @Override
+        public void onError(Throwable error) {
+            if (handle.stopped.get()) {
+                return;
+            }
+            log.warn("Change stream on {} failed, reopening...", collection.getNamespace(), error);
+            reopen();
+        }
+
+        @Override
+        public void onComplete() {
+            if (handle.stopped.get()) {
+                return;
+            }
+            // The server ended the stream, for instance because the collection was dropped.
+            reopen();
+        }
+
+        private void reopen() {
+            try {
+                watcherExecutor.schedule(
+                        () -> watch(collection, type, handle, listener, clazz),
+                        REOPEN_DELAY_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException e) {
+                log.debug("Not reopening the change stream on {}, the store is shutting down",
+                        collection.getNamespace());
             }
         }
     }
 
     private static final class WatcherHandle {
+
         final AtomicBoolean stopped = new AtomicBoolean(false);
-        private MongoCursor<?> cursor;
+
+        private final BsonTimestamp startAt;
+        private Subscription subscription;
+        private BsonDocument resumeToken;
+
+        WatcherHandle(BsonTimestamp startAt) {
+            this.startAt = startAt;
+        }
+
+        BsonTimestamp startAt() {
+            return startAt;
+        }
 
         /**
-         * Publishes the cursor so {@link #stop()} can close it and unblock
-         * {@code hasNext()}. If stop already happened, closes it right away —
-         * otherwise the watcher would block on a cursor nobody can close.
+         * Publishes the subscription so {@link #stop()} can cancel it. If stop already
+         * happened, cancels it right away — otherwise the stream would stay open with
+         * nobody left to close it.
          */
-        synchronized void setCursor(MongoCursor<?> cursor) {
-            if (cursor != null && stopped.get()) {
-                closeCursorQuietly(cursor);
+        synchronized void setSubscription(Subscription subscription) {
+            if (stopped.get()) {
+                subscription.cancel();
                 return;
             }
-            this.cursor = cursor;
+            this.subscription = subscription;
+        }
+
+        synchronized void setResumeToken(BsonDocument resumeToken) {
+            this.resumeToken = resumeToken;
+        }
+
+        synchronized BsonDocument resumeToken() {
+            return resumeToken;
         }
 
         synchronized void stop() {
             stopped.set(true);
-            closeCursorQuietly(cursor);
-            cursor = null;
+            if (subscription != null) {
+                subscription.cancel();
+                subscription = null;
+            }
         }
     }
 
