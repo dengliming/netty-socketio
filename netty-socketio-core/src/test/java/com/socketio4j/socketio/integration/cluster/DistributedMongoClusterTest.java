@@ -72,20 +72,14 @@ public class DistributedMongoClusterTest {
     }
 
     /**
-     * Starts one node backed by its own {@link MongoClient}, so the two nodes talk to each
-     * other only through change streams — never through a shared in-process client.
+     * Starts one node backed by its own store, so the two nodes talk to each other only
+     * through change streams — never through a shared in-process client.
      */
-    private static SocketIOServer startNode(MongoClient client, EventStoreMode mode, Configuration cfg) {
+    private static SocketIOServer startNode(MongoEventStore store, Configuration cfg) {
         DistributedClusterIntegrationSupport.applyReuseListenAddress(cfg);
         cfg.setHostname("127.0.0.1");
         cfg.setPort(0);
-        cfg.setStoreFactory(
-                new MemoryStoreFactory(
-                        new MongoEventStore.Builder(client, DB_NAME)
-                                .eventStoreMode(mode)
-                                .build()
-                )
-        );
+        cfg.setStoreFactory(new MemoryStoreFactory(store));
 
         SocketIOServer node = new SocketIOServer(cfg);
         DistributedClusterIntegrationSupport.attachDefaultRoomListeners(node);
@@ -98,17 +92,25 @@ public class DistributedMongoClusterTest {
     class SingleChannelMemoryTest extends DistributedCommonTest {
         private MongoClient mc1;
         private MongoClient mc2;
+        private MongoEventStore store1;
+        private MongoEventStore store2;
 
         @BeforeAll
         void setupNodes() {
             Configuration cfg1 = new Configuration();
             mc1 = MONGO_CONTAINER.createClient();
-            node1 = startNode(mc1, EventStoreMode.SINGLE_CHANNEL, cfg1);
+            store1 = new MongoEventStore.Builder(mc1, DB_NAME)
+                    .eventStoreMode(EventStoreMode.SINGLE_CHANNEL)
+                    .build();
+            node1 = startNode(store1, cfg1);
             port1 = cfg1.getPort();
 
             Configuration cfg2 = new Configuration();
             mc2 = MONGO_CONTAINER.createClient();
-            node2 = startNode(mc2, EventStoreMode.SINGLE_CHANNEL, cfg2);
+            store2 = new MongoEventStore.Builder(mc2, DB_NAME)
+                    .eventStoreMode(EventStoreMode.SINGLE_CHANNEL)
+                    .build();
+            node2 = startNode(store2, cfg2);
             port2 = cfg2.getPort();
         }
 
@@ -117,6 +119,10 @@ public class DistributedMongoClusterTest {
             TestResourceCleanup.runAll("MongoDB cluster node cleanup",
                     () -> { if (node1 != null) node1.stop(); },
                     () -> { if (node2 != null) node2.stop(); },
+                    // Stopping a node leaves its event store running, so close the change
+                    // streams before the clients they are reading from.
+                    () -> { if (store1 != null) store1.shutdown(); },
+                    () -> { if (store2 != null) store2.shutdown(); },
                     () -> { if (mc1 != null) mc1.close(); },
                     () -> { if (mc2 != null) mc2.close(); });
         }
@@ -127,17 +133,25 @@ public class DistributedMongoClusterTest {
     class MultiChannelMemoryTest extends DistributedCommonTest {
         private MongoClient mc1;
         private MongoClient mc2;
+        private MongoEventStore store1;
+        private MongoEventStore store2;
 
         @BeforeAll
         void setupNodes() {
             Configuration cfg1 = new Configuration();
             mc1 = MONGO_CONTAINER.createClient();
-            node1 = startNode(mc1, EventStoreMode.MULTI_CHANNEL, cfg1);
+            store1 = new MongoEventStore.Builder(mc1, DB_NAME)
+                    .eventStoreMode(EventStoreMode.MULTI_CHANNEL)
+                    .build();
+            node1 = startNode(store1, cfg1);
             port1 = cfg1.getPort();
 
             Configuration cfg2 = new Configuration();
             mc2 = MONGO_CONTAINER.createClient();
-            node2 = startNode(mc2, EventStoreMode.MULTI_CHANNEL, cfg2);
+            store2 = new MongoEventStore.Builder(mc2, DB_NAME)
+                    .eventStoreMode(EventStoreMode.MULTI_CHANNEL)
+                    .build();
+            node2 = startNode(store2, cfg2);
             port2 = cfg2.getPort();
         }
 
@@ -146,6 +160,10 @@ public class DistributedMongoClusterTest {
             TestResourceCleanup.runAll("MongoDB cluster node cleanup",
                     () -> { if (node1 != null) node1.stop(); },
                     () -> { if (node2 != null) node2.stop(); },
+                    // Stopping a node leaves its event store running, so close the change
+                    // streams before the clients they are reading from.
+                    () -> { if (store1 != null) store1.shutdown(); },
+                    () -> { if (store2 != null) store2.shutdown(); },
                     () -> { if (mc1 != null) mc1.close(); },
                     () -> { if (mc2 != null) mc2.close(); });
         }
