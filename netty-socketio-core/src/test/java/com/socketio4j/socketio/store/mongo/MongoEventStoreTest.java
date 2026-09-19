@@ -392,4 +392,98 @@ public class MongoEventStoreTest {
 
                 store.shutdown0();
         }
+
+        @Test
+        @SuppressWarnings("unchecked")
+        void testChangeSubscriberCatchesExceptionFromListener() {
+                when(mongoCollection.getNamespace()).thenReturn(new MongoNamespace("testdb.events"));
+                MongoEventStore store = new MongoEventStore.Builder(mongoClient, "testdb")
+                                .nodeId(50L)
+                                .build();
+
+                MongoEventStore.WatcherHandle handle = new MongoEventStore.WatcherHandle(new BsonTimestamp(1, 1));
+                EventListener<DispatchMessage> listener = mock(EventListener.class);
+                org.mockito.Mockito.doThrow(new RuntimeException("Error in listener")).when(listener).onMessage(any());
+
+                MongoEventStore.ChangeSubscriber<DispatchMessage> subscriber = store.new ChangeSubscriber<>(
+                                mongoCollection, EventType.DISPATCH, handle, listener, DispatchMessage.class);
+
+                ChangeStreamDocument<Document> change = mock(ChangeStreamDocument.class);
+                Document doc = new Document()
+                                .append("nodeId", 99L)
+                                .append("eventType", "DISPATCH")
+                                .append("payload",
+                                                "{\"room\":\"r\",\"namespace\":\"/\",\"packet\":{\"type\":2,\"data\":\"hi\"}}");
+
+                when(change.getFullDocument()).thenReturn(doc);
+                when(change.getResumeToken()).thenReturn(new BsonDocument());
+
+                // Should safely catch Throwable without propagating or failing
+                assertDoesNotThrow(() -> subscriber.onNext(change));
+
+                store.shutdown0();
+        }
+
+        @Test
+        void testStandaloneErrorDetectionInChangeSubscriber() {
+                when(mongoCollection.getNamespace()).thenReturn(new MongoNamespace("testdb.events"));
+                MongoEventStore store = new MongoEventStore.Builder(mongoClient, "testdb")
+                                .nodeId(1L)
+                                .build();
+
+                MongoEventStore.WatcherHandle handle = new MongoEventStore.WatcherHandle(new BsonTimestamp(1, 1));
+                MongoEventStore.ChangeSubscriber<DispatchMessage> subscriber = store.new ChangeSubscriber<>(
+                                mongoCollection, EventType.DISPATCH, handle, msg -> {
+                                }, DispatchMessage.class);
+
+                MongoCommandException standaloneEx = mock(MongoCommandException.class);
+                when(standaloneEx.getErrorCode()).thenReturn(40573);
+                when(standaloneEx.getMessage())
+                                .thenReturn("The $changeStream stage is only supported on replica sets");
+
+                assertDoesNotThrow(() -> subscriber.onError(standaloneEx));
+
+                store.shutdown0();
+        }
+
+        @Test
+        void testShutdownAsyncCompletesPromptly() {
+                MongoEventStore store = new MongoEventStore.Builder(mongoClient, "testdb")
+                                .build();
+
+                java.util.concurrent.CompletableFuture<Void> future = store.shutdownAsync();
+                assertNotNull(future);
+                assertDoesNotThrow(() -> future.get(2, java.util.concurrent.TimeUnit.SECONDS));
+                assertTrue(future.isDone());
+        }
+
+        @Test
+        @SuppressWarnings("unchecked")
+        void testSubscribe0IsNonBlocking() {
+                when(mongoDatabase.getCollection(anyString())).thenReturn(mongoCollection);
+                when(mongoCollection.getNamespace()).thenReturn(new MongoNamespace("testdb.events"));
+
+                // Mock ping publisher that never completes (simulating a slow network)
+                Publisher<Document> slowPingPublisher = subscriber -> {
+                        // intentionally do not invoke onNext or onComplete
+                };
+                when(mongoDatabase.runCommand(any(Document.class))).thenReturn(slowPingPublisher);
+
+                Publisher<String> indexPublisher = subscriber -> subscriber.onSubscribe(mock(Subscription.class));
+                when(mongoCollection.createIndex(any(org.bson.conversions.Bson.class), any(com.mongodb.client.model.IndexOptions.class)))
+                                .thenReturn(indexPublisher);
+
+                MongoEventStore store = new MongoEventStore.Builder(mongoClient, "testdb")
+                                .nodeId(1L)
+                                .build();
+
+                long start = System.currentTimeMillis();
+                // subscribe0 must return immediately without waiting for ping or index
+                store.subscribe0(EventType.DISPATCH, msg -> {
+                }, DispatchMessage.class);
+                long elapsed = System.currentTimeMillis() - start;
+
+                assertTrue(elapsed < 200, "subscribe0 blocked for " + elapsed + "ms, expected non-blocking (<200ms)");
+                store.shutdown0();
+        }
 }

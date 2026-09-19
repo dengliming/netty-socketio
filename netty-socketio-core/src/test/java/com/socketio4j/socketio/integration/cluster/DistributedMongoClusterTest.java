@@ -30,8 +30,8 @@ import com.socketio4j.socketio.Configuration;
 import com.socketio4j.socketio.SocketIOServer;
 import com.socketio4j.socketio.store.container.CustomizedMongoContainer;
 import com.socketio4j.socketio.store.event.EventStoreMode;
-import com.socketio4j.socketio.store.memory.MemoryStoreFactory;
 import com.socketio4j.socketio.store.mongo.MongoEventStore;
+import com.socketio4j.socketio.store.mongo.MongoStoreFactory;
 
 /**
  * Runs {@link DistributedCommonTest} against all MongoDB-backed cluster variants while sharing
@@ -79,7 +79,7 @@ public class DistributedMongoClusterTest {
         DistributedClusterIntegrationSupport.applyReuseListenAddress(cfg);
         cfg.setHostname("127.0.0.1");
         cfg.setPort(0);
-        cfg.setStoreFactory(new MemoryStoreFactory(store));
+        cfg.setStoreFactory(new MongoStoreFactory(store));
 
         SocketIOServer node = new SocketIOServer(cfg);
         DistributedClusterIntegrationSupport.attachDefaultRoomListeners(node);
