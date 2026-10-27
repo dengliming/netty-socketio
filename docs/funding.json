@@ -41,7 +41,7 @@
         "status": "active",
         "name": "One-time contribution",
         "description": "Make a one-time contribution of any amount to help sustain SocketIO4j development and maintenance.",
-        "amount": 0,
+        "amount": 100,
         "currency": "USD",
         "frequency": "one-time",
         "channels": ["open-collective"]
@@ -51,7 +51,7 @@
         "status": "active",
         "name": "Monthly sponsorship",
         "description": "Provide recurring monthly support for ongoing maintenance, testing, documentation, and project infrastructure.",
-        "amount": 0,
+        "amount": 100,
         "currency": "USD",
         "frequency": "monthly",
         "channels": ["open-collective"]
